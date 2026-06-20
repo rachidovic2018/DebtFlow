@@ -1,0 +1,742 @@
+// MCA CRM — INFERRED schema (best-effort from CLAUDE.md; the authoritative
+// /docs/schema.prisma with the exact 26 models was not provided).
+//
+// HARD RULES (CLAUDE.md):
+//  1. An MCA is a PURCHASE OF FUTURE RECEIVABLES, not a loan. No interest rate,
+//     no fixed maturity. Use factorRate, purchasedAmount, advanceAmount,
+//     holdbackPct, estimatedTermDays (an ESTIMATE).
+//  2. Money is integer cents stored as BigInt. Convert at the UI edge only.
+//  3. Deal balances are DERIVED from the append-only LedgerEntry table, never
+//     stored. The ledger moves only on confirmed settlement.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ───────────────────────────── ENUMS ─────────────────────────────
+
+enum UserRole {
+  ADMIN
+  SALES_REP
+  BROKER_MANAGER
+  UNDERWRITER
+  FUNDER_OPS
+  COLLECTIONS
+  SYNDICATION_MANAGER
+  AUDITOR_READONLY
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  APPLICATION_STARTED
+  CONVERTED
+  LOST
+}
+
+enum ClientStatus {
+  PROSPECT
+  ACTIVE_CLIENT
+  DELINQUENT
+  COMPLETED
+  DEFAULTED
+  RENEWED
+}
+
+enum GuaranteeType {
+  PERFORMANCE_VALIDITY // default — NOT absolute repayment
+  ABSOLUTE
+}
+
+enum ApplicationStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  UNDERWRITING
+  APPROVED
+  DECLINED
+  FUNDED
+  WITHDRAWN
+}
+
+enum DecisionOutcome {
+  APPROVED
+  DECLINED
+  COUNTER
+}
+
+enum RemittanceFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum DealStatus {
+  PENDING
+  FUNDED
+  COLLECTING
+  COMPLETED
+  DEFAULTED
+  RENEWED
+}
+
+enum LedgerEntryType {
+  PAYBACK_COLLECTION
+  OVER_COLLECTION_CREDIT
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum RemittanceStatus {
+  SCHEDULED
+  SUBMITTED
+  CLEARED
+  RETURNED
+  ADJUSTED
+  CANCELLED
+}
+
+enum ReconciliationStatus {
+  PENDING
+  RECOMPUTED
+  CREDITED
+  DENIED
+  COMPLETED
+}
+
+enum CollectionsStatus {
+  OPEN
+  IN_PROGRESS
+  PAYMENT_PLAN
+  RESOLVED
+  WRITTEN_OFF
+}
+
+enum CollectionsBucket {
+  CURRENT
+  DPD_1_15
+  DPD_16_30
+  DPD_31_60
+  DPD_61_90
+  DPD_90_PLUS
+}
+
+enum ContractStatus {
+  DRAFT
+  SENT
+  VIEWED
+  SIGNED
+  DECLINED
+  VOID
+}
+
+enum TransactionType {
+  FUNDING_OUTFLOW
+  CLIENT_PAYMENT
+  COMMISSION_PAYOUT
+  SYNDICATION_DISTRIBUTION
+  FEE
+  REFUND
+}
+
+enum TransactionStatus {
+  PENDING
+  CLEARED
+  RECONCILED
+  FAILED
+}
+
+enum EppsEnrollmentStatus {
+  PENDING
+  ENROLLED
+  FAILED
+  RE_ENROLL_REQUIRED
+}
+
+enum EppsPaymentStatus {
+  QUEUED
+  SUBMITTED
+  CLEARED
+  RETURNED
+  CANCELLED
+}
+
+enum DocumentType {
+  BANK_STATEMENT
+  CONTRACT
+  STIP
+  IDENTITY
+  VOIDED_CHECK
+  OTHER
+}
+
+enum StipStatus {
+  REQUESTED
+  RECEIVED
+  WAIVED
+  REJECTED
+}
+
+enum ParticipationStatus {
+  PROPOSED
+  COMMITTED
+  FUNDED
+  CLOSED
+}
+
+// ───────────────────────────── IDENTITY ─────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String?
+  role         UserRole @default(SALES_REP)
+  active       Boolean  @default(true)
+  teamId       String?
+  team         Team?    @relation(fields: [teamId], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  managedTeams          Team[]                 @relation("TeamManager")
+  ownedLeads            Lead[]                 @relation("LeadOwner")
+  ownedClients          Client[]               @relation("ClientOwner")
+  ownedApplications     Application[]          @relation("ApplicationOwner")
+  underwritingDecisions UnderwritingDecision[]
+  uploadedDocuments     Document[]
+  activities            Activity[]             @relation("ActivityActor")
+  auditLogs             AuditLog[]             @relation("AuditActor")
+  assignedCollections   CollectionsCase[]      @relation("CollectionsAssignee")
+  reconciliations       Reconciliation[]       @relation("ReconciliationReviewer")
+
+  @@index([teamId])
+  @@index([role])
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  managerId String?
+  manager   User?    @relation("TeamManager", fields: [managerId], references: [id])
+  members   User[]
+  clients   Client[]
+  createdAt DateTime @default(now())
+
+  @@index([managerId])
+}
+
+model Broker {
+  id            String        @id @default(cuid())
+  name          String
+  email         String?       @unique
+  phone         String?
+  // Commission as a fraction (0.0300 = 3%). Not a loan rate.
+  commissionPct Decimal       @default(0) @db.Decimal(6, 4)
+  status        String        @default("ACTIVE")
+  leads         Lead[]
+  clients       Client[]
+  applications  Application[]
+  transactions  Transaction[]
+  createdAt     DateTime      @default(now())
+}
+
+// ───────────────────────────── SALES PIPELINE ─────────────────────────────
+
+model Lead {
+  id                   String     @id @default(cuid())
+  businessName         String
+  contactName          String?
+  email                String?
+  phone                String?
+  status               LeadStatus @default(NEW)
+  score                Int?
+  source               String?
+  requestedAmountCents BigInt?
+  ownerId              String?
+  owner                User?      @relation("LeadOwner", fields: [ownerId], references: [id])
+  brokerId             String?
+  broker               Broker?    @relation(fields: [brokerId], references: [id])
+  convertedClientId    String?    @unique
+  convertedClient      Client?    @relation("LeadConversion", fields: [convertedClientId], references: [id])
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  @@index([status])
+  @@index([ownerId])
+  @@index([brokerId])
+}
+
+// ───────────────────────────── CLIENT (the account) ─────────────────────────────
+
+model Client {
+  id           String       @id @default(cuid())
+  legalName    String
+  dba          String?
+  sector       String? // business sector / industry (dashboard ranks by this)
+  businessType String?
+  ein          String?
+  phone        String?
+  email        String?
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+  status       ClientStatus @default(PROSPECT)
+  // Client score (0-100). Total debt is DERIVED from creditorRelationships.
+  clientScore  Int?
+  ownerId      String?
+  owner        User?        @relation("ClientOwner", fields: [ownerId], references: [id])
+  teamId       String?
+  team         Team?        @relation(fields: [teamId], references: [id])
+  brokerId     String?
+  broker       Broker?      @relation(fields: [brokerId], references: [id])
+
+  fromLead              Lead?                  @relation("LeadConversion")
+  contacts              Contact[]
+  bankAccounts          BankAccount[]
+  applications          Application[]
+  deals                 Deal[]
+  creditorRelationships CreditorRelationship[]
+  documents             Document[]
+  contracts             Contract[]
+  transactions          Transaction[]
+  collectionsCases      CollectionsCase[]
+  eppsEnrollment        EppsEnrollment?
+  eppsPayments          EppsPayment[]
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  @@index([status])
+  @@index([ownerId])
+  @@index([teamId])
+  @@index([sector])
+}
+
+model Contact {
+  id            String        @id @default(cuid())
+  clientId      String
+  client        Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  fullName      String
+  email         String?
+  phone         String?
+  title         String?
+  ownershipPct  Decimal?      @db.Decimal(5, 2)
+  isGuarantor   Boolean       @default(false)
+  guaranteeType GuaranteeType @default(PERFORMANCE_VALIDITY)
+  // Encrypted at rest; never sent to unprivileged roles.
+  ssnEncrypted  String?
+  dob           DateTime?     @db.Date
+  createdAt     DateTime      @default(now())
+
+  @@index([clientId])
+}
+
+model BankAccount {
+  id               String   @id @default(cuid())
+  clientId         String
+  client           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  bankName         String
+  accountNumberEnc String // encrypted at rest
+  routingNumberEnc String // encrypted at rest
+  accountType      String?
+  isPrimary        Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  @@index([clientId])
+}
+
+// ───────────────────────────── APPLICATION / UNDERWRITING ─────────────────────────────
+
+model Application {
+  id                   String            @id @default(cuid())
+  clientId             String
+  client               Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  ownerId              String?
+  owner                User?             @relation("ApplicationOwner", fields: [ownerId], references: [id])
+  brokerId             String?
+  broker               Broker?           @relation(fields: [brokerId], references: [id])
+  status               ApplicationStatus @default(SUBMITTED)
+  requestedAmountCents BigInt?
+  useOfFunds           String?
+  // Renewal linkage (a renewal application references the prior deal).
+  priorDealId          String?
+  priorDeal            Deal?             @relation("RenewalSource", fields: [priorDealId], references: [id])
+
+  // Computed underwriting features (filled async after statement ingestion).
+  avgMonthlyRevenueCents BigInt?
+  depositVolatility      Decimal? @db.Decimal(6, 4)
+  negativeDays           Int?
+  avgDailyBalanceCents   BigInt?
+  hasStacking            Boolean?
+  revenueTrend           String?
+
+  decisions UnderwritingDecision[]
+  stips     Stip[]
+  documents Document[]
+  deal      Deal?                  @relation("ApplicationDeal")
+  contracts Contract[]
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+
+  @@index([clientId])
+  @@index([status])
+  @@index([ownerId])
+}
+
+model UnderwritingDecision {
+  id                  String               @id @default(cuid())
+  applicationId       String
+  application         Application          @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  underwriterId       String?
+  underwriter         User?                @relation(fields: [underwriterId], references: [id])
+  version             Int                  @default(1)
+  outcome             DecisionOutcome
+  approvedAmountCents BigInt? // advance amount approved
+  factorRate          Decimal?             @db.Decimal(5, 4) // e.g. 1.4900
+  holdbackPct         Decimal?             @db.Decimal(5, 4) // e.g. 0.1200
+  remittanceFrequency RemittanceFrequency?
+  estimatedTermDays   Int? // labeled an ESTIMATE in UI
+  paybackAmountCents  BigInt? // purchased receivables = approved * factor
+  conditions          String?
+  contracts           Contract[]
+  createdAt           DateTime             @default(now())
+
+  @@unique([applicationId, version])
+  @@index([applicationId])
+}
+
+// ───────────────────────────── DEAL + LEDGER ─────────────────────────────
+
+model Deal {
+  id            String       @id @default(cuid())
+  clientId      String
+  client        Client       @relation(fields: [clientId], references: [id])
+  applicationId String?      @unique
+  application   Application? @relation("ApplicationDeal", fields: [applicationId], references: [id])
+  status        DealStatus   @default(PENDING)
+
+  // Receivables-purchase terms (NOT a loan).
+  advanceAmountCents   BigInt // funded to merchant
+  purchasedAmountCents BigInt // total receivables purchased (payback)
+  factorRate           Decimal             @db.Decimal(5, 4)
+  holdbackPct          Decimal             @db.Decimal(5, 4)
+  remittanceFrequency  RemittanceFrequency @default(DAILY)
+  estimatedTermDays    Int
+  fundedAt             DateTime?
+
+  ledgerEntries    LedgerEntry[]
+  remittances      Remittance[]
+  collectionsCases CollectionsCase[]
+  participations   Participation[]
+  eppsPayments     EppsPayment[]
+  transactions     Transaction[]
+  renewals         Application[]     @relation("RenewalSource")
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  Reconciliation   Reconciliation[]
+  Contract         Contract[]
+
+  @@index([clientId])
+  @@index([status])
+}
+
+// Append-only. Deal balance = purchasedAmount − Σ(PAYBACK_COLLECTION) (+/- adj).
+model LedgerEntry {
+  id            String          @id @default(cuid())
+  dealId        String
+  deal          Deal            @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  type          LedgerEntryType
+  amountCents   BigInt
+  eppsPaymentId String?
+  transactionId String?
+  occurredAt    DateTime        @default(now())
+  createdAt     DateTime        @default(now())
+
+  @@index([dealId])
+  @@index([occurredAt])
+}
+
+model Remittance {
+  id            String              @id @default(cuid())
+  dealId        String
+  deal          Deal                @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  scheduledDate DateTime
+  amountCents   BigInt
+  frequency     RemittanceFrequency
+  status        RemittanceStatus    @default(SCHEDULED)
+  eppsPaymentId String?
+  createdAt     DateTime            @default(now())
+
+  @@index([dealId])
+  @@index([scheduledDate])
+}
+
+model Reconciliation {
+  id                        String               @id @default(cuid())
+  dealId                    String
+  deal                      Deal                 @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  periodStart               DateTime
+  periodEnd                 DateTime
+  reportedReceiptsCents     BigInt
+  recomputedRemittanceCents BigInt
+  overCollectionCreditCents BigInt?
+  status                    ReconciliationStatus @default(PENDING)
+  denialReason              String?
+  slaDueAt                  DateTime?
+  reviewedById              String?
+  reviewedBy                User?                @relation("ReconciliationReviewer", fields: [reviewedById], references: [id])
+  createdAt                 DateTime             @default(now())
+
+  @@index([dealId])
+  @@index([status])
+}
+
+model CollectionsCase {
+  id                      String            @id @default(cuid())
+  dealId                  String
+  deal                    Deal              @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  clientId                String
+  client                  Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  status                  CollectionsStatus @default(OPEN)
+  bucket                  CollectionsBucket @default(CURRENT)
+  openedFromEppsPaymentId String?
+  balanceAtOpenCents      BigInt?
+  assignedToId            String?
+  assignedTo              User?             @relation("CollectionsAssignee", fields: [assignedToId], references: [id])
+  // Receipts-based plan only — never a fixed loan schedule.
+  paymentPlan             Json?
+  openedAt                DateTime          @default(now())
+  resolvedAt              DateTime?
+
+  @@index([dealId])
+  @@index([status])
+  @@index([bucket])
+}
+
+model Participation {
+  id                  String              @id @default(cuid())
+  dealId              String
+  deal                Deal                @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  investorName        String
+  participationPct    Decimal             @db.Decimal(5, 2)
+  investedAmountCents BigInt
+  status              ParticipationStatus @default(PROPOSED)
+  distributions       Json?
+  createdAt           DateTime            @default(now())
+
+  @@index([dealId])
+}
+
+// ───────────────────────────── CREDITORS ─────────────────────────────
+
+model Creditor {
+  id            String                 @id @default(cuid())
+  name          String                 @unique
+  sector        String?
+  relationships CreditorRelationship[]
+  createdAt     DateTime               @default(now())
+}
+
+model CreditorRelationship {
+  id                  String   @id @default(cuid())
+  clientId            String
+  client              Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  creditorId          String
+  creditor            Creditor @relation(fields: [creditorId], references: [id], onDelete: Cascade)
+  balanceCents        BigInt
+  monthlyPaymentCents BigInt?
+  status              String?
+  createdAt           DateTime @default(now())
+
+  @@unique([clientId, creditorId])
+  @@index([clientId])
+  @@index([creditorId])
+}
+
+// ───────────────────────────── CONTRACTS (DigiSigner) ─────────────────────────────
+
+model ContractTemplate {
+  id                   String     @id @default(cuid())
+  name                 String
+  digisignerTemplateId String?
+  // Maps CRM fields → DigiSigner field_api_ids (+ readOnly flags).
+  fieldMapping         Json?
+  docType              String     @default("MCA_AGREEMENT")
+  isActive             Boolean    @default(true)
+  contracts            Contract[]
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+}
+
+model Contract {
+  id                     String                @id @default(cuid())
+  clientId               String
+  client                 Client                @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  applicationId          String?
+  application            Application?          @relation(fields: [applicationId], references: [id])
+  underwritingDecisionId String?
+  underwritingDecision   UnderwritingDecision? @relation(fields: [underwritingDecisionId], references: [id])
+  dealId                 String?
+  deal                   Deal?                 @relation(fields: [dealId], references: [id])
+  templateId             String?
+  template               ContractTemplate?     @relation(fields: [templateId], references: [id])
+  status                 ContractStatus        @default(DRAFT)
+  digisignerRequestId    String?
+  // Audit snapshot of the exact prefilled terms (must match the decision).
+  mergedData             Json?
+  signedDocumentUrl      String?
+  sentAt                 DateTime?
+  signedAt               DateTime?
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+
+  @@index([clientId])
+  @@index([status])
+  @@index([dealId])
+}
+
+// ───────────────────────────── ACCOUNTING (company books) ─────────────────────────────
+
+model Transaction {
+  id            String            @id @default(cuid())
+  type          TransactionType
+  status        TransactionStatus @default(PENDING)
+  amountCents   BigInt
+  clientId      String?
+  client        Client?           @relation(fields: [clientId], references: [id])
+  dealId        String?
+  deal          Deal?             @relation(fields: [dealId], references: [id])
+  brokerId      String?
+  broker        Broker?           @relation(fields: [brokerId], references: [id])
+  eppsPaymentId String?
+  occurredAt    DateTime          @default(now())
+  reconciledAt  DateTime?
+  createdAt     DateTime          @default(now())
+
+  @@index([type])
+  @@index([status])
+  @@index([clientId])
+  @@index([dealId])
+  @@index([occurredAt])
+}
+
+// ───────────────────────────── EPPS GATEWAY ─────────────────────────────
+
+model EppsEnrollment {
+  id             String               @id @default(cuid())
+  clientId       String               @unique
+  client         Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  status         EppsEnrollmentStatus @default(PENDING)
+  eppsCustomerId String?
+  gateway        String?
+  enrolledAt     DateTime?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+}
+
+model EppsPayment {
+  id          String            @id @default(cuid())
+  dealId      String
+  deal        Deal              @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  clientId    String
+  client      Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  status      EppsPaymentStatus @default(QUEUED)
+  amountCents BigInt
+  dueDate     DateTime
+  batchWindow String? // "12:30CT" | "14:30CT"
+  submittedAt DateTime?
+  clearedAt   DateTime?
+  returnedAt  DateTime?
+  returnCode  String?
+  eppsTxnId   String?           @unique // idempotency guard
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([dealId])
+  @@index([clientId])
+  @@index([status])
+  @@index([dueDate])
+}
+
+// ───────────────────────────── DOCS / STIPS / AUDIT ─────────────────────────────
+
+model Document {
+  id            String       @id @default(cuid())
+  type          DocumentType @default(OTHER)
+  fileName      String
+  blobUrl       String?
+  clientId      String?
+  client        Client?      @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  applicationId String?
+  application   Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  uploadedById  String?
+  uploadedBy    User?        @relation(fields: [uploadedById], references: [id])
+  stips         Stip[]
+  createdAt     DateTime     @default(now())
+
+  @@index([clientId])
+  @@index([applicationId])
+}
+
+model Stip {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  name          String
+  status        StipStatus  @default(REQUESTED)
+  documentId    String?
+  document      Document?   @relation(fields: [documentId], references: [id])
+  notes         String?
+  requestedAt   DateTime    @default(now())
+  receivedAt    DateTime?
+
+  @@index([applicationId])
+  @@index([status])
+}
+
+model Activity {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("ActivityActor", fields: [actorId], references: [id])
+  entityType String // "Lead" | "Client" | "Deal" | ...
+  entityId   String
+  type       String
+  summary    String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// Precomputed dashboard rollups (CLAUDE.md Phase 9). A cron writes heavy
+// rankings here; the dashboard reads the snapshot instead of aggregating live.
+model Snapshot {
+  key        String   @id
+  data       Json
+  computedAt DateTime @default(now())
+}
+
+// Immutable. Every status change + money movement writes one.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id])
+  entityType String
+  entityId   String
+  action     String
+  fromValue  String?
+  toValue    String?
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}

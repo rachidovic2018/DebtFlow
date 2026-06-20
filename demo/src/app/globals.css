@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas: 210 40% 98%;
+  --background: 0 0% 100%;
+  --foreground: 222 47% 11%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+
+  --primary: 222 47% 11%;
+  --primary-foreground: 0 0% 100%;
+
+  --accent: 243 75% 59%;
+  --accent-foreground: 0 0% 100%;
+
+  --success: 160 84% 39%;
+  --success-foreground: 0 0% 100%;
+
+  --warning: 38 92% 50%;
+  --warning-foreground: 222 47% 11%;
+
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+
+  --info: 199 89% 48%;
+  --info-foreground: 0 0% 100%;
+
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 243 75% 59%;
+
+  --radius: 0.625rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--canvas));
+  color: hsl(var(--foreground));
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular numbers for all financial figures. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Thin, refined scrollbars. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background-color: hsl(214 20% 84%);
+  border-radius: 9999px;
+  border: 3px solid hsl(var(--canvas));
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: hsl(214 18% 74%);
+}

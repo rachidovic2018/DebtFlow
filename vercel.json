@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    { "path": "/api/cron/snapshot", "schedule": "0 6 * * *" },
+    { "path": "/api/cron/scheduler", "schedule": "0 12 * * *" },
+    { "path": "/api/cron/epps-batch", "schedule": "30 18 * * *" },
+    { "path": "/api/cron/epps-sync", "schedule": "45 18 * * *" },
+    { "path": "/api/cron/epps-batch", "schedule": "30 20 * * *" },
+    { "path": "/api/cron/epps-sync", "schedule": "45 20 * * *" }
+  ]
+}
